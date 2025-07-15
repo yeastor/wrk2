@@ -7,6 +7,8 @@
 #include <sys/types.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
+#include <err.h>
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -15,32 +17,28 @@
 #include "stats.h"
 #include "ae.h"
 #include "http_parser.h"
-#include "hdr_histogram.h"
 
-#define VERSION  "4.0.0"
 #define RECVBUF  8192
-#define SAMPLES  100000000
 
+#define MAX_THREAD_RATE_S   10000000
 #define SOCKET_TIMEOUT_MS   2000
-#define CALIBRATE_DELAY_MS  10000
-#define TIMEOUT_INTERVAL_MS 2000
+#define RECORD_INTERVAL_MS  100
+
+extern const char *VERSION;
 
 typedef struct {
     pthread_t thread;
     aeEventLoop *loop;
     struct addrinfo *addr;
     uint64_t connections;
-    int interval;
-    uint64_t stop_at;
     uint64_t complete;
     uint64_t requests;
     uint64_t bytes;
     uint64_t start;
-    double throughput;
-    uint64_t mean;
-    struct hdr_histogram *latency_histogram;
-    struct hdr_histogram *u_latency_histogram;
-    tinymt64_t rand;
+    uint64_t requested;
+    uint64_t connect;
+    uint64_t first_byte;
+    uint64_t last_byte;
     lua_State *L;
     errors errors;
     struct connection *cs;
@@ -60,14 +58,13 @@ typedef struct connection {
     } state;
     int fd;
     SSL *ssl;
-    double throughput;
-    double catch_up_throughput;
-    uint64_t complete;
-    uint64_t complete_at_last_batch_start;
-    uint64_t catch_up_start_time;
-    uint64_t complete_at_catch_up_start;
-    uint64_t thread_start;
+    bool delayed;
+    bool delay_in_progress;
     uint64_t start;
+    uint64_t requested;
+    uint64_t connect;
+    uint64_t first_byte;
+    uint64_t last_byte;
     char *request;
     size_t length;
     size_t written;
@@ -75,14 +72,6 @@ typedef struct connection {
     buffer headers;
     buffer body;
     char buf[RECVBUF];
-    uint64_t actual_latency_start;
-    bool has_pending;
-    bool caught_up;
-    // Internal tracking numbers (used purely for debugging):
-    uint64_t latest_should_send_time;
-    uint64_t latest_expected_start;
-    uint64_t latest_connect;
-    uint64_t latest_write;
 } connection;
 
 #endif /* WRK_H */

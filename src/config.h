@@ -5,9 +5,17 @@
 #define HAVE_KQUEUE
 #elif defined(__linux__)
 #define HAVE_EPOLL
-#define _POSIX_C_SOURCE 200809L
+#include <netinet/in.h>
+#ifdef IP_BIND_ADDRESS_NO_PORT
+#define HAS_IP_BIND_ADDRESS_NO_PORT
+#endif
 #elif defined (__sun)
 #define HAVE_EVPORT
+#define _XPG6
+#define __EXTENSIONS__
+#include <stropts.h>
+#include <sys/filio.h>
+#include <sys/time.h>
 #endif
 
 #endif /* CONFIG_H */

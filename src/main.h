@@ -31,10 +31,7 @@ static void *thread_main(void *);
 static int connect_socket(thread *, connection *);
 static int reconnect_socket(thread *, connection *);
 
-static int calibrate(aeEventLoop *, long long, void *);
-static int sample_rate(aeEventLoop *, long long, void *);
-static int delayed_initial_connect(aeEventLoop *, long long, void *);
-static int check_timeouts(aeEventLoop *, long long, void *);
+static int record_rate(aeEventLoop *, long long, void *);
 
 static void socket_connected(aeEventLoop *, int, void *, int);
 static void socket_writeable(aeEventLoop *, int, void *, int);
@@ -49,9 +46,9 @@ static uint64_t time_us();
 
 static int parse_args(struct config *, char **, struct http_parser_url *, char **, int, char **);
 static char *copy_url_part(char *, struct http_parser_url *, enum http_parser_url_fields);
+
 static void print_stats_header();
 static void print_stats(char *, stats *, char *(*)(long double));
 static void print_stats_latency(stats *);
-static void print_hdr_latency(struct hdr_histogram*, const char*);
 
 #endif /* MAIN_H */
