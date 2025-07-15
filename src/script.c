@@ -4,6 +4,7 @@
 #include <string.h>
 #include "script.h"
 #include "http_parser.h"
+#include "stats.h"
 #include "zmalloc.h"
 
 typedef struct {
@@ -14,32 +15,31 @@ typedef struct {
 
 static int script_addr_tostring(lua_State *);
 static int script_addr_gc(lua_State *);
-static int script_stats_call(lua_State *);
 static int script_stats_len(lua_State *);
-static int script_stats_index(lua_State *);
+static int script_stats_get(lua_State *);
 static int script_thread_index(lua_State *);
 static int script_thread_newindex(lua_State *);
 static int script_wrk_lookup(lua_State *);
 static int script_wrk_connect(lua_State *);
+static int script_wrk_time_us(lua_State *);
 
 static void set_fields(lua_State *, int, const table_field *);
 static void set_field(lua_State *, int, char *, int);
 static int push_url_part(lua_State *, char *, struct http_parser_url *, enum http_parser_url_fields);
 
-static const struct luaL_Reg addrlib[] = {
+static const struct luaL_reg addrlib[] = {
     { "__tostring", script_addr_tostring   },
     { "__gc"    ,   script_addr_gc         },
     { NULL,         NULL                   }
 };
 
-static const struct luaL_Reg statslib[] = {
-    { "__call",     script_stats_call      },
-    { "__index",    script_stats_index     },
+static const struct luaL_reg statslib[] = {
+    { "__index",    script_stats_get       },
     { "__len",      script_stats_len       },
     { NULL,         NULL                   }
 };
 
-static const struct luaL_Reg threadlib[] = {
+static const struct luaL_reg threadlib[] = {
     { "__index",    script_thread_index    },
     { "__newindex", script_thread_newindex },
     { NULL,         NULL                   }
@@ -68,6 +68,7 @@ lua_State *script_create(char *file, char *url, char **headers) {
     const table_field fields[] = {
         { "lookup",  LUA_TFUNCTION, script_wrk_lookup  },
         { "connect", LUA_TFUNCTION, script_wrk_connect },
+        { "time_us", LUA_TFUNCTION, script_wrk_time_us },
         { "path",    LUA_TSTRING,   path               },
         { NULL,      0,             NULL               },
     };
@@ -141,14 +142,6 @@ void script_init(lua_State *L, thread *t, int argc, char **argv) {
     lua_pop(t->L, 1);
 }
 
-uint64_t script_delay(lua_State *L) {
-    lua_getglobal(L, "delay");
-    lua_call(L, 0, 1);
-    uint64_t delay = lua_tonumber(L, -1);
-    lua_pop(L, 1);
-    return delay;
-}
-
 void script_request(lua_State *L, char **buf, size_t *len) {
     int pop = 1;
     lua_getglobal(L, "request");
@@ -197,10 +190,6 @@ bool script_want_response(lua_State *L) {
     return script_is_function(L, "response");
 }
 
-bool script_has_delay(lua_State *L) {
-    return script_is_function(L, "delay");
-}
-
 bool script_has_done(lua_State *L) {
     return script_is_function(L, "done");
 }
@@ -241,19 +230,21 @@ void script_errors(lua_State *L, errors *errors) {
     lua_setfield(L, 1, "errors");
 }
 
-void script_push_stats(lua_State *L, stats *s) {
-    stats **ptr = (stats **) lua_newuserdata(L, sizeof(stats **));
-    *ptr = s;
-    luaL_getmetatable(L, "wrk.stats");
-    lua_setmetatable(L, -2);
-}
-
 void script_done(lua_State *L, stats *latency, stats *requests) {
+    stats **s;
+
     lua_getglobal(L, "done");
     lua_pushvalue(L, 1);
 
-    script_push_stats(L, latency);
-    script_push_stats(L, requests);
+    s = (stats **) lua_newuserdata(L, sizeof(stats **));
+    *s = latency;
+    luaL_getmetatable(L, "wrk.stats");
+    lua_setmetatable(L, 4);
+
+    s = (stats **) lua_newuserdata(L, sizeof(stats **));
+    *s = requests;
+    luaL_getmetatable(L, "wrk.stats");
+    lua_setmetatable(L, 5);
 
     lua_call(L, 3, 0);
     lua_pop(L, 1);
@@ -355,31 +346,37 @@ static int script_stats_percentile(lua_State *L) {
     return 1;
 }
 
-static int script_stats_call(lua_State *L) {
+static int script_stats_get(lua_State *L) {
     stats *s = checkstats(L);
-    uint64_t index = lua_tonumber(L, 2);
-    uint64_t count;
-    lua_pushnumber(L, stats_value_at(s, index - 1, &count));
-    lua_pushnumber(L, count);
-    return 2;
-}
-
-static int script_stats_index(lua_State *L) {
-    stats *s = checkstats(L);
-    const char *method = lua_tostring(L, 2);
-    if (!strcmp("min",   method)) lua_pushnumber(L, s->min);
-    if (!strcmp("max",   method)) lua_pushnumber(L, s->max);
-    if (!strcmp("mean",  method)) lua_pushnumber(L, stats_mean(s));
-    if (!strcmp("stdev", method)) lua_pushnumber(L, stats_stdev(s, stats_mean(s)));
-    if (!strcmp("percentile", method)) {
-        lua_pushcfunction(L, script_stats_percentile);
+    if (lua_isnumber(L, 2)) {
+        int index = luaL_checkint(L, 2);
+        if (s->histogram) {
+            double percentile = 100.0 * ((double) index) / s->histogram->total_count;
+            int64_t value = hdr_value_at_percentile(s->histogram, percentile);
+            lua_pushnumber(L, value);
+        } else {
+            lua_pushnumber(L, s->data[index - 1]);
+        }
+    } else if (lua_isstring(L, 2)) {
+        const char *method = lua_tostring(L, 2);
+        if (!strcmp("min",   method)) lua_pushnumber(L, s->min);
+        if (!strcmp("max",   method)) lua_pushnumber(L, s->max);
+        if (!strcmp("mean",  method)) lua_pushnumber(L, stats_mean(s));
+        if (!strcmp("stdev", method)) lua_pushnumber(L, stats_stdev(s, stats_mean(s)));
+        if (!strcmp("percentile", method)) {
+            lua_pushcfunction(L, script_stats_percentile);
+        }
     }
     return 1;
 }
 
 static int script_stats_len(lua_State *L) {
     stats *s = checkstats(L);
-    lua_pushinteger(L, stats_popcount(s));
+    if (s->histogram) {
+        lua_pushinteger(L, s->histogram->total_count);
+    } else {
+        lua_pushinteger(L, s->limit);
+    }
     return 1;
 }
 
@@ -474,6 +471,14 @@ static int script_wrk_connect(lua_State *L) {
     return 1;
 }
 
+static int script_wrk_time_us(lua_State *L) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint64_t now = (tv.tv_sec * 1000000) + tv.tv_usec;
+    lua_pushnumber(L, now);
+    return 1;
+}
+
 void script_copy_value(lua_State *src, lua_State *dst, int index) {
     switch (lua_type(src, index)) {
         case LUA_TBOOLEAN:
@@ -492,8 +497,8 @@ void script_copy_value(lua_State *src, lua_State *dst, int index) {
             lua_newtable(dst);
             lua_pushnil(src);
             while (lua_next(src, index - 1)) {
-                script_copy_value(src, dst, -2);
                 script_copy_value(src, dst, -1);
+                script_copy_value(src, dst, -2);
                 lua_settable(dst, -3);
                 lua_pop(src, 1);
             }

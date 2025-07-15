@@ -8,18 +8,58 @@
 
 #include "ssl.h"
 
-SSL_CTX *ssl_init() {
+static pthread_mutex_t *locks;
+
+static void ssl_lock(int mode, int n, const char *file, int line) {
+    pthread_mutex_t *lock = &locks[n];
+    if (mode & CRYPTO_LOCK) {
+        pthread_mutex_lock(lock);
+    } else {
+        pthread_mutex_unlock(lock);
+    }
+}
+
+static unsigned long ssl_id() {
+    return (unsigned long) pthread_self();
+}
+
+SSL_CTX *ssl_init(char *clientcert, char *clientkey, char *cafile, char *capath) {
     SSL_CTX *ctx = NULL;
 
     SSL_load_error_strings();
     SSL_library_init();
     OpenSSL_add_all_algorithms();
 
-    if ((ctx = SSL_CTX_new(SSLv23_client_method()))) {
-        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-        SSL_CTX_set_verify_depth(ctx, 0);
-        SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
-        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
+    if ((locks = calloc(CRYPTO_num_locks(), sizeof(pthread_mutex_t)))) {
+        for (int i = 0; i < CRYPTO_num_locks(); i++) {
+            pthread_mutex_init(&locks[i], NULL);
+        }
+
+        CRYPTO_set_locking_callback(ssl_lock);
+        CRYPTO_set_id_callback(ssl_id);
+
+        if ((ctx = SSL_CTX_new(SSLv23_client_method()))) {
+			if (!cafile && !capath) {
+				SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+				SSL_CTX_set_verify_depth(ctx, 0);
+			} else {
+				SSL_CTX_load_verify_locations(ctx, cafile, capath);
+			}
+			SSL_CTX_set_mode(ctx, SSL_MODE_AUTO_RETRY);
+			SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
+
+			if (clientcert) {
+				if(1 != SSL_CTX_use_certificate_chain_file(ctx, clientcert)) {
+					fprintf(stderr, "unable to load client certificate chain\n");
+					return NULL;
+				}
+				if(1 != SSL_CTX_use_PrivateKey_file(
+					  ctx, clientkey, SSL_FILETYPE_PEM)) {
+					fprintf(stderr, "unable to load client key\n");
+					return NULL;
+				}
+			}
+        }
     }
 
     return ctx;
